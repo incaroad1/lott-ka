@@ -2,516 +2,366 @@ from __future__ import annotations
 
 import json
 import threading
-import traceback
-from dataclasses import asdict, is_dataclass
+import tkinter as tk
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, StringVar, Tk, Toplevel, filedialog, messagebox
-from tkinter import ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from src.services.compare_pipeline import run_compare_pipeline
-from src.services.csv_source_manager import ensure_csv_available
-from src.services.lstm_pipeline import run_lstm_pipeline
-from src.services.rf_pipeline import run_random_forest_pipeline
+from src.services.csv_loader import ensure_latest_csv_for_game
 from src.services.skandi_combined_pipeline import run_skandi_combined_pipeline
-from src.services.ticket_generator import generate_tickets_from_prediction
-from src.services.xgb_pipeline import run_xgboost_pipeline
 
 
-DEFAULT_CSV = {
-    "otos": "data/otos.csv",
-    "hatos": "data/hatos.csv",
-    "skandi_gepi": "data/skandi.csv",
-    "skandi_kezi": "data/skandi.csv",
-    "skandi_kombinalt": "data/skandi.csv",
-}
+GAME_OPTIONS = [
+    ("Ötöslottó", "otos"),
+    ("Hatoslottó", "hatos"),
+    ("Skandináv lottó - gépi", "skandi_gepi"),
+    ("Skandináv lottó - kézi", "skandi_kezi"),
+    ("Skandináv lottó - kombinált", "skandi_kombinalt"),
+]
 
-MODEL_LABELS = {
-    "compare": "Összehasonlítás + ensemble",
-    "random_forest": "RandomForest",
-    "xgboost": "XGBoost",
-    "lstm": "LSTM",
-}
+PROFILE_OPTIONS = [
+    ("Konzervatív", "konzervativ"),
+    ("Kiegyensúlyozott", "kiegyensulyozott"),
+    ("Agresszív", "agressziv"),
+]
 
-GAME_LABELS = {
-    "otos": "Ötöslottó",
-    "hatos": "Hatoslottó",
-    "skandi_gepi": "Skandináv – gépi",
-    "skandi_kezi": "Skandináv – kézi",
-    "skandi_kombinalt": "Skandináv – kombinált",
-}
+VIEW_OPTIONS = [
+    ("Egyszerűsített nézet", "simple"),
+    ("JSON nézet", "json"),
+]
 
 
-class LottoGuiApp:
+class LottoGuiApp(tk.Tk):
     def __init__(self) -> None:
-        self.root = Tk()
-        self.root.title("Magyar Lottó AI – GUI")
-        self.root.geometry("1180x780")
+        super().__init__()
+        self.title("Magyar Lottó AI")
+        self.geometry("1100x760")
+        self.minsize(960, 680)
 
-        self.project_root = Path(__file__).resolve().parents[2]
+        self.selected_game = tk.StringVar(value="otos")
+        self.ticket_count = tk.IntVar(value=3)
+        self.ticket_profile = tk.StringVar(value="kiegyensulyozott")
+        self.view_mode = tk.StringVar(value="simple")
 
-        self.game_var = StringVar(value="otos")
-        self.mode_var = StringVar(value="compare")
-        self.csv_var = StringVar(value=str(self.project_root / DEFAULT_CSV["otos"]))
-        self.ticket_count_var = StringVar(value="3")
-        self.strategy_var = StringVar(value="diverzifikalt")
-
-        self.status_var = StringVar(value="Készen áll.")
-        self._status_base_text = "Elemzés folyamatban"
-        self._status_dots = 0
+        self.status_text = tk.StringVar(value="Készen áll.")
+        self.csv_path_text = tk.StringVar(value="")
+        self.is_running = False
         self._animation_job: str | None = None
-        self._is_running = False
-
-        self.latest_result: dict[str, Any] | None = None
-        self.latest_source_info: dict[str, Any] | None = None
-        self.ticket_window: Toplevel | None = None
-        self.ticket_listbox = None
+        self._animation_phase = 0
+        self._last_result: dict[str, Any] | None = None
 
         self._build_ui()
-        self._bind_events()
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill=BOTH, expand=True)
+        top = ttk.Frame(self, padding=12)
+        top.pack(fill="x")
 
-        controls = ttk.LabelFrame(main, text="Beállítások", padding=10)
-        controls.pack(fill="x")
-
-        ttk.Label(controls, text="Játék:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
+        ttk.Label(top, text="Játék:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         self.game_combo = ttk.Combobox(
-            controls,
-            textvariable=self.game_var,
+            top,
             state="readonly",
-            width=22,
-            values=list(GAME_LABELS.keys()),
-        )
-        self.game_combo.grid(row=0, column=1, sticky="w", pady=6)
-
-        ttk.Label(controls, text="Mód:").grid(row=0, column=2, sticky="w", padx=(18, 8), pady=6)
-        self.mode_combo = ttk.Combobox(
-            controls,
-            textvariable=self.mode_var,
-            state="readonly",
+            values=[label for label, _value in GAME_OPTIONS],
             width=28,
-            values=list(MODEL_LABELS.keys()),
         )
-        self.mode_combo.grid(row=0, column=3, sticky="w", pady=6)
+        self.game_combo.grid(row=0, column=1, sticky="w", pady=4)
+        self.game_combo.current(0)
+        self.game_combo.bind("<<ComboboxSelected>>", lambda e: self._on_game_changed(self.game_combo.get()))
 
-        ttk.Label(controls, text="Szelvények:").grid(row=0, column=4, sticky="w", padx=(18, 8), pady=6)
-        ttk.Spinbox(
-            controls,
-            from_=1,
-            to=20,
-            textvariable=self.ticket_count_var,
-            width=6,
-        ).grid(row=0, column=5, sticky="w", pady=6)
+        ttk.Label(top, text="Szelvény darab:").grid(row=0, column=2, sticky="w", padx=(20, 8), pady=4)
+        ticket_spin = ttk.Spinbox(top, from_=1, to=10, textvariable=self.ticket_count, width=6)
+        ticket_spin.grid(row=0, column=3, sticky="w", pady=4)
 
-        ttk.Label(controls, text="Stratégia:").grid(row=0, column=6, sticky="w", padx=(18, 8), pady=6)
-        ttk.Combobox(
-            controls,
-            textvariable=self.strategy_var,
+        ttk.Label(top, text="Játékstílus:").grid(row=0, column=4, sticky="w", padx=(20, 8), pady=4)
+        self.profile_combo = ttk.Combobox(
+            top,
             state="readonly",
-            width=16,
-            values=["diverzifikalt", "top"],
-        ).grid(row=0, column=7, sticky="w", pady=6)
+            values=[label for label, _value in PROFILE_OPTIONS],
+            width=18,
+        )
+        self.profile_combo.grid(row=0, column=5, sticky="w", pady=4)
+        self.profile_combo.current(1)
+        self.profile_combo.bind("<<ComboboxSelected>>", lambda e: self._on_profile_changed(self.profile_combo.get()))
 
-        ttk.Label(controls, text="CSV fájl:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        self.csv_entry = ttk.Entry(controls, textvariable=self.csv_var, width=92)
-        self.csv_entry.grid(row=1, column=1, columnspan=7, sticky="ew", pady=6)
+        ttk.Label(top, text="Nézet:").grid(row=0, column=6, sticky="w", padx=(20, 8), pady=4)
+        self.view_combo = ttk.Combobox(
+            top,
+            state="readonly",
+            values=[label for label, _value in VIEW_OPTIONS],
+            width=20,
+        )
+        self.view_combo.grid(row=0, column=7, sticky="w", pady=4)
+        self.view_combo.current(0)
+        self.view_combo.bind("<<ComboboxSelected>>", lambda e: self._on_view_changed(self.view_combo.get()))
 
-        ttk.Button(controls, text="Tallózás", command=self._browse_csv).grid(
-            row=1, column=8, padx=(8, 0), pady=6
+        ttk.Button(top, text="CSV kiválasztása", command=self._select_csv).grid(
+            row=1, column=0, sticky="w", pady=(10, 4)
+        )
+        ttk.Label(top, textvariable=self.csv_path_text).grid(
+            row=1, column=1, columnspan=7, sticky="w", pady=(10, 4)
         )
 
-        self.run_btn = ttk.Button(controls, text="Futtatás", command=self._run_clicked)
-        self.run_btn.grid(row=0, column=8, padx=(8, 0), pady=6)
+        button_row = ttk.Frame(self, padding=(12, 0))
+        button_row.pack(fill="x")
 
-        self.tickets_btn = ttk.Button(
-            controls,
-            text="Ajánlott szelvények",
-            command=self._show_ticket_window,
-            state="disabled",
-        )
-        self.tickets_btn.grid(row=0, column=9, padx=(8, 0), pady=6)
+        ttk.Button(button_row, text="Futtatás", command=self._run_pipeline_safe).pack(side="left")
+        ttk.Button(button_row, text="Eredmény mentése", command=self._save_result).pack(side="left", padx=8)
+        ttk.Button(button_row, text="Szelvények megnyitása", command=self._open_tickets_window).pack(side="left")
 
-        controls.columnconfigure(7, weight=1)
+        status_row = ttk.Frame(self, padding=(12, 8))
+        status_row.pack(fill="x")
+        ttk.Label(status_row, textvariable=self.status_text).pack(anchor="w")
 
-        top_pane = ttk.Panedwindow(main, orient="horizontal")
-        top_pane.pack(fill=BOTH, expand=True, pady=(12, 0))
+        self.output = tk.Text(self, wrap="word", font=("Consolas", 10))
+        self.output.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        left = ttk.LabelFrame(top_pane, text="Összefoglaló", padding=10)
-        right = ttk.LabelFrame(top_pane, text="Részletes kimenet", padding=10)
+    def _on_game_changed(self, label: str) -> None:
+        for game_label, game_value in GAME_OPTIONS:
+            if game_label == label:
+                self.selected_game.set(game_value)
+                break
 
-        top_pane.add(left, weight=1)
-        top_pane.add(right, weight=2)
+    def _on_profile_changed(self, label: str) -> None:
+        for profile_label, profile_value in PROFILE_OPTIONS:
+            if profile_label == label:
+                self.ticket_profile.set(profile_value)
+                break
 
-        self.summary_text = ScrolledText(left, wrap="word", height=18)
-        self.summary_text.pack(fill=BOTH, expand=True)
+    def _on_view_changed(self, label: str) -> None:
+        for view_label, view_value in VIEW_OPTIONS:
+            if view_label == label:
+                self.view_mode.set(view_value)
+                break
 
-        self.output_text = ScrolledText(right, wrap="word", height=18)
-        self.output_text.pack(fill=BOTH, expand=True)
+        if self._last_result is not None:
+            self._render_result(self._last_result)
 
-        status_bar = ttk.Frame(main)
-        status_bar.pack(fill="x", pady=(8, 0))
-
-        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=220)
-        self.progress.pack(side=RIGHT, padx=(12, 0))
-
-        ttk.Label(status_bar, textvariable=self.status_var).pack(side=LEFT)
-
-    def _bind_events(self) -> None:
-        self.game_combo.bind("<<ComboboxSelected>>", self._on_game_changed)
-
-    def _on_game_changed(self, _event: Any = None) -> None:
-        rel = DEFAULT_CSV.get(self.game_var.get())
-        if rel:
-            self.csv_var.set(str(self.project_root / rel))
-
-    def _browse_csv(self) -> None:
+    def _select_csv(self) -> None:
         path = filedialog.askopenfilename(
             title="CSV kiválasztása",
             filetypes=[("CSV fájl", "*.csv"), ("Minden fájl", "*.*")],
         )
         if path:
-            self.csv_var.set(path)
+            self.csv_path_text.set(path)
 
-    def _run_clicked(self) -> None:
-        csv_path = Path(self.csv_var.get().strip())
-        jatek = self.game_var.get()
-
-        try:
-            source_info = ensure_csv_available(
-                jatek=jatek,
-                local_path=csv_path,
-                force_refresh=True,
-            )
-        except Exception as exc:
-            messagebox.showerror("CSV hiba", str(exc))
+    def _run_pipeline_safe(self) -> None:
+        if self.is_running:
             return
 
-        resolved_csv_path = Path(source_info["csv_path"])
-        self.latest_source_info = source_info
-
-        self.run_btn.configure(state="disabled")
-        self.tickets_btn.configure(state="disabled")
-        self.summary_text.delete("1.0", END)
-        self.output_text.delete("1.0", END)
-
+        self.is_running = True
+        self.status_text.set("Feldolgozás indul...")
         self._start_animation()
 
-        threading.Thread(
-            target=self._run_pipeline_safe,
-            args=(resolved_csv_path,),
-            daemon=True,
-        ).start()
+        thread = threading.Thread(target=self._run_pipeline_thread, daemon=True)
+        thread.start()
 
-    def _start_animation(self) -> None:
-        self._is_running = True
-        self._status_dots = 0
-        self.progress.start(12)
-        self._tick_status()
-
-    def _stop_animation(self, final_text: str) -> None:
-        self._is_running = False
-        if self._animation_job is not None:
-            try:
-                self.root.after_cancel(self._animation_job)
-            except Exception:
-                pass
-            self._animation_job = None
-        self.progress.stop()
-        self.status_var.set(final_text)
-
-    def _tick_status(self) -> None:
-        if not self._is_running:
-            return
-
-        self._status_dots = (self._status_dots + 1) % 4
-        self.status_var.set(self._status_base_text + "." * self._status_dots)
-        self._animation_job = self.root.after(400, self._tick_status)
-
-    def _run_pipeline_safe(self, csv_path: Path) -> None:
+    def _run_pipeline_thread(self) -> None:
         try:
+            csv_path = self._resolve_csv_path()
             result = self._run_pipeline(csv_path)
-            self.root.after(0, lambda: self._show_result(result))
-        except Exception as exc:
-            details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            self.root.after(0, lambda: self._show_error(details))
+            self.after(0, lambda: self._on_pipeline_success(result))
+        except Exception as e:
+            self.after(0, lambda: self._on_pipeline_error(e))
 
-    def _run_pipeline(self, csv_path: Path) -> dict[str, Any]:
-        mode = self.mode_var.get()
-        jatek = self.game_var.get()
-        ticket_count = max(1, int(self.ticket_count_var.get() or "1"))
-        strategy = self.strategy_var.get() or "diverzifikalt"
+    def _resolve_csv_path(self) -> str:
+        manual_path = self.csv_path_text.get().strip()
+        if manual_path:
+            return manual_path
+
+        jatek = self.selected_game.get()
+        if jatek == "skandi_kombinalt":
+            base_game = "skandi_gepi"
+        else:
+            base_game = jatek
+
+        return ensure_latest_csv_for_game(base_game)
+
+    def _run_pipeline(self, csv_path: str) -> dict[str, Any]:
+        jatek = self.selected_game.get()
+        ticket_count = max(1, int(self.ticket_count.get()))
+        ticket_profile = self.ticket_profile.get()
 
         if jatek == "skandi_kombinalt":
-            result = run_skandi_combined_pipeline(csv_path=csv_path, mode=mode)
-            prediction = (
-                result.get("prediction")
-                or result.get("models", {}).get("skandi_kombinalt", {}).get("prediction")
-            )
-            if prediction:
-                result["ticket_bundle"] = generate_tickets_from_prediction(
-                    prediction,
-                    jatek=jatek,
-                    ticket_count=ticket_count,
-                    strategy=strategy,
-                )
-            return result
-
-        if mode == "compare":
-            result = run_compare_pipeline(csv_path=csv_path, jatek=jatek)
-            pred = (result.get("models", {}).get("ensemble_avg", {}) or {}).get("prediction")
-        elif mode == "random_forest":
-            result = run_random_forest_pipeline(csv_path=csv_path, jatek=jatek)
-            pred = result.get("prediction")
-        elif mode == "xgboost":
-            result = run_xgboost_pipeline(csv_path=csv_path, jatek=jatek)
-            pred = result.get("prediction")
-        elif mode == "lstm":
-            result = run_lstm_pipeline(csv_path=csv_path, jatek=jatek)
-            pred = result.get("prediction")
-        else:
-            raise ValueError(f"Ismeretlen mód: {mode}")
-
-        if pred:
-            result["ticket_bundle"] = generate_tickets_from_prediction(
-                pred,
-                jatek=jatek,
+            return run_skandi_combined_pipeline(
+                csv_path=csv_path,
                 ticket_count=ticket_count,
-                strategy=strategy,
+                ticket_profile=ticket_profile,
             )
 
-        return result
-
-    def _show_result(self, result: dict[str, Any]) -> None:
-        self.latest_result = result
-        self.run_btn.configure(state="normal")
-        self.tickets_btn.configure(state="normal")
-
-        source_info = self.latest_source_info or {}
-        if source_info.get("internet_ok") is False:
-            self._stop_animation("Futtatás kész. Offline mód: helyi CSV használva.")
-        elif source_info.get("source_mode") == "fallback_local":
-            self._stop_animation("Futtatás kész. Online frissítés nem sikerült, helyi CSV használva.")
-        else:
-            self._stop_animation("Futtatás kész.")
-
-        self.summary_text.insert("1.0", self._format_summary(result))
-        self.output_text.insert("1.0", self._format_details(result))
-
-    def _show_error(self, details: str) -> None:
-        self.run_btn.configure(state="normal")
-        self.tickets_btn.configure(state="disabled")
-        self._stop_animation("Hiba történt.")
-        self.output_text.insert("1.0", details)
-        messagebox.showerror(
-            "Futtatási hiba",
-            "A pipeline hibára futott. A részletek a jobb oldali panelen vannak.",
+        return run_compare_pipeline(
+            csv_path=csv_path,
+            jatek=jatek,
+            ticket_count=ticket_count,
+            ticket_profile=ticket_profile,
         )
 
-    def _extract_tickets(self) -> list[list[int]]:
-        if not self.latest_result:
-            return []
+    def _on_pipeline_success(self, result: dict[str, Any]) -> None:
+        self.is_running = False
+        self._stop_animation()
+        self._last_result = result
+        self.status_text.set("Feldolgozás kész.")
+        self._render_result(result)
 
-        bundle = self.latest_result.get("ticket_bundle") or {}
-        tickets = bundle.get("tickets") or []
-        return tickets
+    def _on_pipeline_error(self, error: Exception) -> None:
+        self.is_running = False
+        self._stop_animation()
+        self.status_text.set("Hiba történt.")
+        messagebox.showerror("Hiba", str(error))
 
-    def _copy_selected_ticket(self) -> None:
-        if not self.ticket_window or self.ticket_listbox is None:
+    def _render_result(self, result: dict[str, Any]) -> None:
+        self.output.delete("1.0", tk.END)
+
+        if self.view_mode.get() == "json":
+            pretty = json.dumps(result, ensure_ascii=False, indent=2)
+            self.output.insert("1.0", pretty)
             return
 
-        selected = self.ticket_listbox.curselection()
-        if not selected:
-            return
+        simple_text = self._build_simple_view(result)
+        self.output.insert("1.0", simple_text)
 
-        idx = selected[0]
-        line = self.ticket_listbox.get(idx)
+    def _build_simple_view(self, result: dict[str, Any]) -> str:
+        lines: list[str] = []
 
-        parts = line.split(":", 1)
-        text = parts[1].strip() if len(parts) == 2 else line.strip()
+        imported = result.get("imported_record_count", "-")
+        errors = result.get("error_count", "-")
+        best_model = result.get("best_model", "-")
+        ticket_profile = result.get("meta", {}).get("ticket_profile", self.ticket_profile.get())
 
-        self.ticket_window.clipboard_clear()
-        self.ticket_window.clipboard_append(text)
-        self.ticket_window.update()
+        lines.append("=== ÖSSZEFOGLALÓ ===")
+        lines.append(f"Importált rekordok: {imported}")
+        lines.append(f"Hibák száma: {errors}")
+        lines.append(f"Legjobb modell: {best_model}")
+        lines.append(f"Szelvényprofil: {self._profile_label_from_value(ticket_profile)}")
+        lines.append("")
 
-    def _copy_all_tickets(self, tickets: list[list[int]]) -> None:
-        if not self.ticket_window:
-            return
-
-        plain = []
-        for ticket in tickets:
-            plain.append(", ".join(str(n) for n in ticket))
-
-        text = "\n".join(plain)
-        self.ticket_window.clipboard_clear()
-        self.ticket_window.clipboard_append(text)
-        self.ticket_window.update()
-
-    def _toggle_ticket_window_topmost(self) -> None:
-        if not self.ticket_window:
-            return
-
-        current = bool(self.ticket_window.attributes("-topmost"))
-        self.ticket_window.attributes("-topmost", not current)
-
-    def _show_ticket_window(self) -> None:
-        tickets = self._extract_tickets()
-        if not tickets:
-            messagebox.showinfo("Nincs szelvény", "Még nincs megjeleníthető ajánlott szelvény.")
-            return
-
-        if self.ticket_window is not None:
-            try:
-                self.ticket_window.destroy()
-            except Exception:
-                pass
-            self.ticket_window = None
-
-        self.ticket_window = Toplevel(self.root)
-        self.ticket_window.title("Ajánlott szelvények")
-        self.ticket_window.geometry("430x360")
-        self.ticket_window.attributes("-topmost", True)
-        self.ticket_window.resizable(True, True)
-
-        container = ttk.Frame(self.ticket_window, padding=12)
-        container.pack(fill=BOTH, expand=True)
-
-        ttk.Label(
-            container,
-            text="Ajánlott szelvények",
-            font=("Segoe UI", 11, "bold"),
-        ).pack(anchor="w", pady=(0, 6))
-
-        ttk.Label(
-            container,
-            text="A sorok külön kijelölhetők. Az ablak induláskor mindig felül van.",
-        ).pack(anchor="w", pady=(0, 8))
-
-        list_frame = ttk.Frame(container)
-        list_frame.pack(fill=BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
-        scrollbar.pack(side=RIGHT, fill="y")
-
-        import tkinter as tk
-
-        self.ticket_listbox = tk.Listbox(
-            list_frame,
-            activestyle="dotbox",
-            exportselection=False,
-            selectmode="browse",
-            font=("Consolas", 11),
-        )
-        self.ticket_listbox.pack(side=LEFT, fill=BOTH, expand=True)
-        self.ticket_listbox.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.ticket_listbox.yview)
-
-        for i, ticket in enumerate(tickets, start=1):
-            ticket_text = ", ".join(str(n) for n in ticket)
-            self.ticket_listbox.insert(END, f"{i}. szelvény: {ticket_text}")
-
-        if tickets:
-            self.ticket_listbox.selection_set(0)
-            self.ticket_listbox.activate(0)
-
-        btn_row = ttk.Frame(container)
-        btn_row.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(
-            btn_row,
-            text="Kijelölt másolása",
-            command=self._copy_selected_ticket,
-        ).pack(side=LEFT)
-
-        ttk.Button(
-            btn_row,
-            text="Összes másolása",
-            command=lambda: self._copy_all_tickets(tickets),
-        ).pack(side=LEFT, padx=(8, 0))
-
-        ttk.Button(
-            btn_row,
-            text="Mindig felül ki/be",
-            command=self._toggle_ticket_window_topmost,
-        ).pack(side=LEFT, padx=(8, 0))
-
-    def _format_summary(self, result: dict[str, Any]) -> str:
-        lines = [
-            f"Játék: {GAME_LABELS.get(self.game_var.get(), self.game_var.get())}",
-            f"Mód: {MODEL_LABELS.get(self.mode_var.get(), self.mode_var.get())}",
-            f"Beolvasott rekordok: {result.get('imported_record_count', '-')}",
-            f"Hibás sorok: {result.get('error_count', '-')}",
-        ]
-
-        source_info = self.latest_source_info or {}
-        if source_info:
-            lines.append(f"CSV forrásmód: {source_info.get('source_mode', '-')}")
-            lines.append(f"Internet elérhető: {'igen' if source_info.get('internet_ok') else 'nem'}")
-            lines.append(f"Forrás üzenet: {source_info.get('message', '-')}")
-
-        if "best_model" in result:
-            lines.append(f"Legjobb modell: {result.get('best_model')}")
-
-        scoreboard = result.get("scoreboard") or result.get("ranking") or []
+        scoreboard = result.get("scoreboard", [])
         if scoreboard:
-            lines += ["", "Rangsor:"]
+            lines.append("=== MODELL ÖSSZEHASONLÍTÁS ===")
             for row in scoreboard:
-                if isinstance(row, dict) and "avg_hit_at_5" in row:
-                    lines.append(
-                        f"- {row.get('modell')}: "
-                        f"hit@5={row.get('avg_hit_at_5')}, "
-                        f"hit@10={row.get('avg_hit_at_10')}, "
-                        f"any@5={row.get('any_hit_rate_at_5')}"
-                    )
-                else:
-                    lines.append(f"- {row}")
+                lines.append(
+                    f"- {row.get('modell', '?')}: "
+                    f"avg_hit_at_5={row.get('avg_hit_at_5', 0)}, "
+                    f"avg_hit_at_10={row.get('avg_hit_at_10', 0)}, "
+                    f"any_hit_rate_at_5={row.get('any_hit_rate_at_5', 0)}"
+                )
+            lines.append("")
 
-        pred = result.get("prediction")
-        if not pred and self.mode_var.get() == "compare":
-            pred = (result.get("models", {}).get("ensemble_avg", {}) or {}).get("prediction")
-        if not pred:
-            pred = result.get("ensemble_prediction")
+        models = result.get("models", {})
+        chosen_prediction = None
+        if best_model == "ensemble_smart":
+            chosen_prediction = models.get("ensemble_avg", {}).get("prediction")
+        elif isinstance(best_model, str):
+            chosen_prediction = models.get(best_model, {}).get("prediction")
 
-        if pred:
-            lines += ["", f"Ajánlott számok: {pred.get('top_szamok')}"]
+        if chosen_prediction:
+            lines.append("=== AJÁNLOTT TOP SZÁMOK ===")
+            lines.append(", ".join(str(x) for x in chosen_prediction.get("top_szamok", [])))
+            lines.append("")
 
-        bundle = result.get("ticket_bundle") or {}
-        tickets = bundle.get("tickets") or []
-        if tickets:
-            lines += ["", f"Szelvények ({bundle.get('strategy')}):"]
-            for i, ticket in enumerate(tickets, start=1):
-                lines.append(f"{i}. {ticket}")
+        ticket_bundle = result.get("ticket_bundle")
+        if ticket_bundle and ticket_bundle.get("tickets"):
+            lines.append("=== GENERÁLT SZELVÉNYEK ===")
+            for idx, ticket in enumerate(ticket_bundle.get("tickets", []), start=1):
+                lines.append(f"{idx}. " + "  ".join(str(x) for x in ticket))
+            lines.append("")
 
-        return "\n".join(lines)
+        if best_model == "ensemble_smart":
+            ensemble_meta = models.get("ensemble_avg", {}).get("meta", {})
+            weights = ensemble_meta.get("weights", {})
+            if weights:
+                lines.append("=== ENSEMBLE SÚLYOK ===")
+                for name, value in weights.items():
+                    lines.append(f"- {name}: {value}")
+                lines.append("")
 
-    def _format_details(self, result: dict[str, Any]) -> str:
-        return json.dumps(self._normalize_for_json(result), indent=2, ensure_ascii=False)
+        lstm_meta = models.get("lstm", {}).get("meta", {})
+        if lstm_meta and not lstm_meta.get("available", True):
+            lines.append("=== LSTM ===")
+            lines.append(lstm_meta.get("error", "Nem elérhető."))
+            lines.append("")
 
-    def _normalize_for_json(self, value: Any) -> Any:
-        if is_dataclass(value):
-            return self._normalize_for_json(asdict(value))
+        return "\n".join(lines).strip() + "\n"
 
-        if isinstance(value, dict):
-            return {str(k): self._normalize_for_json(v) for k, v in value.items()}
+    def _save_result(self) -> None:
+        if not self._last_result:
+            messagebox.showinfo("Nincs eredmény", "Előbb futtasd a pipeline-t.")
+            return
 
-        if isinstance(value, (list, tuple)):
-            return [self._normalize_for_json(v) for v in value]
+        path = filedialog.asksaveasfilename(
+            title="Eredmény mentése",
+            defaultextension=".json",
+            filetypes=[("JSON fájl", "*.json")],
+        )
+        if not path:
+            return
 
-        try:
-            import numpy as np
+        Path(path).write_text(
+            json.dumps(self._last_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.status_text.set("Eredmény elmentve.")
 
-            if isinstance(value, np.generic):
-                return value.item()
+    def _open_tickets_window(self) -> None:
+        if not self._last_result:
+            messagebox.showinfo("Nincs eredmény", "Előbb futtasd a pipeline-t.")
+            return
 
-            if isinstance(value, np.ndarray):
-                return value.tolist()
-        except Exception:
-            pass
+        ticket_bundle = self._last_result.get("ticket_bundle")
+        if not ticket_bundle or not ticket_bundle.get("tickets"):
+            messagebox.showinfo("Nincs szelvény", "Nincs megjeleníthető szelvény.")
+            return
 
+        win = tk.Toplevel(self)
+        win.title("Generált szelvények")
+        win.geometry("420x320")
+
+        header = ttk.Label(
+            win,
+            text=(
+                f"Profil: {self._profile_label_from_value(self.ticket_profile.get())} | "
+                f"Darab: {ticket_bundle.get('ticket_count', 0)}"
+            ),
+        )
+        header.pack(anchor="w", padx=12, pady=(12, 8))
+
+        listbox = tk.Listbox(win, font=("Consolas", 12), selectmode=tk.EXTENDED)
+        listbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        for idx, ticket in enumerate(ticket_bundle.get("tickets", []), start=1):
+            text = f"{idx}.  " + "  ".join(str(x) for x in ticket)
+            listbox.insert(tk.END, text)
+
+        def copy_selected() -> None:
+            selected = listbox.curselection()
+            if not selected:
+                return
+            lines = [listbox.get(i) for i in selected]
+            text = "\n".join(lines)
+            win.clipboard_clear()
+            win.clipboard_append(text)
+
+        ttk.Button(win, text="Kijelöltek másolása", command=copy_selected).pack(pady=(0, 12))
+
+    def _profile_label_from_value(self, value: str) -> str:
+        for label, raw in PROFILE_OPTIONS:
+            if raw == value:
+                return label
         return value
 
-    def run(self) -> None:
-        self.root.mainloop()
+    def _start_animation(self) -> None:
+        self._animation_phase = 0
+        self._animate_status()
+
+    def _animate_status(self) -> None:
+        if not self.is_running:
+            return
+
+        dots = "." * (self._animation_phase % 4)
+        self.status_text.set(f"Feldolgozás{dots}")
+        self._animation_phase += 1
+        self._animation_job = self.after(350, self._animate_status)
+
+    def _stop_animation(self) -> None:
+        if self._animation_job:
+            self.after_cancel(self._animation_job)
+            self._animation_job = None
